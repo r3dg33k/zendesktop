@@ -82,7 +82,7 @@ jobs:
           cp -r engine/obj-*/dist/*.tar.bz2 ./dist-package/ 2>/dev/null || cp -r engine/obj-*/dist/*.AppImage ./dist-package/ 2>/dev/null || cp -r dist/* ./dist-package/
 
       - name: Upload Binary Artifact
-        uses: actions/artifacts@v4
+        uses: actions/upload-artifact@v4
         with:
           name: ZenBrowser-${{ matrix.target_name }}
           path: ./dist-package/
