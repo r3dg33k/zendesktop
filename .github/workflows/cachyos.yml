@@ -51,9 +51,7 @@ jobs:
           version: latest
 
       - name: Install Node Dependencies
-        run: |
-          pnpm config set block-exotic-subdeps false
-          pnpm install
+        run: pnpm install --no-block-exotic-subdeps
 
       - name: Initialize & Bootstrap Browser Engine
         run: pnpm run init
