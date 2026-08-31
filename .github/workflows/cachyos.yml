@@ -51,7 +51,10 @@ jobs:
           version: latest
 
       - name: Install Node Dependencies
-        run: pnpm install --no-block-exotic-subdeps
+        run: |
+          echo "block-exotic-subdeps=false" >> .npmrc
+          echo "minimum-release-age=0" >> .npmrc
+          pnpm install --no-frozen-lockfile
 
       - name: Initialize & Bootstrap Browser Engine
         run: pnpm run init
