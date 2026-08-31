@@ -1,0 +1,88 @@
+name: Compile Optimized Zen Browser
+
+on:
+  workflow_dispatch: # Allows you to trigger the build manually
+
+jobs:
+  build:
+    name: Build Zen (${{ matrix.target_name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Generic compilation for compatibility across all modern x86_64 CPUs
+          - target_name: "Generic-x86_64"
+            march_flag: "x86-64"
+            mtune_flag: "generic"
+            cflags_extra: ""
+          
+          # Specialized compilation tailored for CachyOS + Ryzen 5900 (Zen 3)
+          - target_name: "CachyOS-Ryzen-5900-znver3"
+            march_flag: "znver3"
+            mtune_flag: "znver3"
+            cflags_extra: "-O3 -flto -fno-plt"
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-size: '20'
+          node-version: 'current'
+
+      - name: System Dependencies & Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clamav curl git libasound2-dev libdbus-1-dev \
+            libegl1-mesa-dev libgl1-mesa-dev libglib2.0-dev libgtk-3-dev libiw-dev libjack-dev \
+            libpulse-dev libx11-xcb-dev libxt-dev mesa-utils python3-pip xorg-dev yasm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: latest
+
+      - name: Install Node Dependencies
+        run: pnpm install
+
+      - name: Initialize & Bootstrap Browser Engine
+        run: pnpm run init
+
+      - name: Inject CachyOS & Ryzen 5900 Compiler Optimizations
+        env:
+          MARCH: ${{ matrix.march_flag }}
+          MTUNE: ${{ matrix.mtune_flag }}
+          EXTRA_FLAGS: ${{ matrix.cflags_extra }}
+        run: |
+          # Inject target flags into global C/C++ compilation environmental variables
+          echo "CFLAGS=-march=$MARCH -mtune=$MTUNE $EXTRA_FLAGS" >> $GITHUB_ENV
+          echo "CXXFLAGS=-march=$MARCH -mtune=$MTUNE $EXTRA_FLAGS" >> $GITHUB_ENV
+          
+          # Inject directly into Mozilla's build configuration system (.mozconfig)
+          echo "ac_add_options --enable-optimize=\"-O3 -march=$MARCH -mtune=$MTUNE\"" >> .mozconfig
+          if [ "${{ matrix.march_flag }}" = "znver3" ]; then
+            echo "ac_add_options --enable-lto" >> .mozconfig
+          fi
+
+      - name: Compile Zen Browser
+        run: pnpm run build
+
+      - name: Package Build Artifacts
+        run: |
+          mkdir ./dist-package
+          # Adjust the source folder based on Zen's compiled output directory structure
+          cp -r engine/obj-*/dist/*.tar.bz2 ./dist-package/ 2>/dev/null || cp -r engine/obj-*/dist/*.AppImage ./dist-package/ 2>/dev/null || cp -r dist/* ./dist-package/
+
+      - name: Upload Binary Artifact
+        uses: actions/artifacts@v4
+        with:
+          name: ZenBrowser-${{ matrix.target_name }}
+          path: ./dist-package/
