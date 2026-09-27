@@ -1,53 +1,49 @@
 name: Compile Optimized Zen Browser
 
 on:
-  workflow_dispatch: # Allows you to trigger the build manually
+  workflow_dispatch:
 
 jobs:
   build:
     name: Build Zen (${{ matrix.target_name }})
     runs-on: ubuntu-24.04
+    # Run everything inside a modern Arch-based container for glibc and toolchain matching
+    container:
+      image: archlinux:latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Generic compilation for compatibility across all modern x86_64 CPUs
-          - target_name: "Generic-x86_64"
-            march_flag: "x86-64"
-            mtune_flag: "generic"
-            cflags_extra: ""
-          
-          # Specialized compilation tailored for CachyOS + Ryzen 5900 (Zen 3)
           - target_name: "CachyOS-Ryzen-5900-znver3"
             march_flag: "znver3"
             mtune_flag: "znver3"
-            cflags_extra: "-O3 -flto -fno-plt"
+            cflags_extra: "-O3 -flto=thin -fno-plt -pipe"
 
     steps:
+      - name: Initialize Arch/CachyOS Toolchain & System Dependencies
+        run: |
+          # Update repositories and install foundational Arch build packages
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed base-devel git curl python nodejs npm yasm \
+            alsa-lib dbus glib2 gtk3 libpulse libx11 libxt mesa clamav
+
       - name: Checkout Source
         uses: actions/checkout@v4
         with:
           fetch-depth: 10
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: System Dependencies & Toolchain
+      - name: Install Rust (via rustup for Arch compatibility)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential clamav curl git libasound2-dev libdbus-1-dev \
-            libegl1-mesa-dev libgl1-mesa-dev libglib2.0-dev libgtk-3-dev libiw-dev libjack-dev \
-            libpulse-dev libx11-xcb-dev libxt-dev mesa-utils python3-pip xorg-dev yasm
+          curl --proto '=https' --tlsv1.2 -sSf https://rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          # Ensure environment updates immediately for subsequent steps
+          export PATH="$HOME/.cargo/bin:$PATH"
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v3
-        with:
-          version: latest
+      - name: Install Corepack & pnpm
+        run: |
+          npm install -g corepack
+          corepack enable
+          corepack prepare pnpm@latest --activate
 
       - name: Install Node Dependencies
         run: |
@@ -64,27 +60,38 @@ jobs:
           MTUNE: ${{ matrix.mtune_flag }}
           EXTRA_FLAGS: ${{ matrix.cflags_extra }}
         run: |
-          # Inject target flags into global C/C++ compilation environmental variables
-          echo "CFLAGS=-march=$MARCH -mtune=$MTUNE $EXTRA_FLAGS" >> $GITHUB_ENV
-          echo "CXXFLAGS=-march=$MARCH -mtune=$MTUNE $EXTRA_FLAGS" >> $GITHUB_ENV
+          MOZCONFIG_PATH="configs/linux/mozconfig"
           
-          # Inject directly into Mozilla's build configuration system (.mozconfig)
-          echo "ac_add_options --enable-optimize=\"-O3 -march=$MARCH -mtune=$MTUNE\"" >> .mozconfig
-          if [ "${{ matrix.march_flag }}" = "znver3" ]; then
-            echo "ac_add_options --enable-lto" >> .mozconfig
+          if [ -f "$MOZCONFIG_PATH" ]; then
+            echo "Injecting target microarchitecture flags into $MOZCONFIG_PATH..."
+            
+            # Using ThinLTO (-flto=thin) which works remarkably well with modern Clang/GCC on Zen 3
+            BUILD_CFLAGS="-march=${MARCH} -mtune=${MTUNE} ${EXTRA_FLAGS}"
+            
+            echo "export CFLAGS=\"\$CFLAGS ${BUILD_CFLAGS}\"" >> "$MOZCONFIG_PATH"
+            echo "export CXXFLAGS=\"\$CXXFLAGS ${BUILD_CFLAGS}\"" >> "$MOZCONFIG_PATH"
+            
+            if [[ "${EXTRA_FLAGS}" == *"-flto"* ]]; then
+              echo "export RUSTFLAGS=\"\$RUSTFLAGS -C linker-plugin-lto -C target-cpu=${MARCH}\"" >> "$MOZCONFIG_PATH"
+            fi
+            
+            echo "--- Modified Mozconfig ---"
+            cat "$MOZCONFIG_PATH"
+          else
+            echo "ac_add_options --enable-optimize=\"-march=${MARCH} -mtune=${MTUNE} ${EXTRA_FLAGS}\"" >> .mozconfig
           fi
 
       - name: Compile Zen Browser
         run: pnpm run build
 
-      - name: Package Build Artifacts
+      - name: Package Output
         run: |
-          mkdir ./dist-package
-          # Adjust the source folder based on Zen's compiled output directory structure
-          cp -r engine/obj-*/dist/*.tar.bz2 ./dist-package/ 2>/dev/null || cp -r engine/obj-*/dist/*.AppImage ./dist-package/ 2>/dev/null || cp -r dist/* ./dist-package/
+          mkdir -p final-artifacts
+          find dist/ firefox-dev/ obj-*/dist/ -name "zen*.tar.xz" -o -name "zen*.tar.bz2" -exec cp {} final-artifacts/ \; || true
 
-      - name: Upload Binary Artifact
+      - name: Upload Optimized Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ZenBrowser-${{ matrix.target_name }}
-          path: ./dist-package/
+          name: Zen-Browser-${{ matrix.target_name }}
+          path: final-artifacts/
+          if-no-files-found: warn
