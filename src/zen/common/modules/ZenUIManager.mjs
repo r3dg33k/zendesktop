@@ -146,6 +146,20 @@ window.gZenUIManager = {
     });
   },
 
+  /**
+   * Shakes an element from side to side to catch the user's eye.
+   *
+   * @param {Element} element
+   * @param {number} delay Milliseconds to wait before shaking.
+   */
+  shakeElement(element, delay = 0) {
+    return this.elementAnimate(
+      element,
+      { x: [0, -12, 8, -4, 2, 0] },
+      { duration: 600, delay, easing: "ease-out" }
+    );
+  },
+
   _addNewCustomizableButtonsIfNeeded() {
     const kPref = "zen.ui.migration.compact-mode-button-added";
     let navbarPlacements = CustomizableUI.getWidgetIdsInArea(
@@ -257,7 +271,7 @@ window.gZenUIManager = {
     };
   },
 
-  updateTabsToolbar() {
+  updateTabsToolbar(fromResizeEvent = false) {
     const kUrlbarHeight = 333;
     gURLBar.style.setProperty(
       "--zen-urlbar-top",
@@ -270,8 +284,8 @@ window.gZenUIManager = {
     gZenVerticalTabsManager.actualWindowButtons.removeAttribute(
       "zen-has-hover"
     );
-    gZenVerticalTabsManager.recalculateURLBarHeight(true);
-    if (!this._preventToolbarRebuild) {
+    gZenVerticalTabsManager.recalculateURLBarHeight(!fromResizeEvent);
+    if (!this._preventToolbarRebuild && !fromResizeEvent) {
       setTimeout(() => {
         gZenWorkspaces.updateTabsContainers();
       }, 0);
@@ -868,7 +882,6 @@ window.gZenUIManager = {
   },
 
   panelUIPosition(panel, anchor) {
-    void panel;
     // The alignment position of the panel is determined during the "popuppositioned" event
     // when the panel opens. The alignment positions help us determine in which orientation
     // the panel is anchored to the screen space.
@@ -991,14 +1004,7 @@ window.gZenVerticalTabsManager = {
     });
 
     ChromeUtils.defineLazyGetter(this, "hidesTabsToolbar", () => {
-      return (
-        document.documentElement
-          .getAttribute("chromehidden")
-          ?.includes("toolbar") ||
-        document.documentElement
-          .getAttribute("chromehidden")
-          ?.includes("menubar")
-      );
+      return document.documentElement.hasAttribute("popup-window");
     });
 
     XPCOMUtils.defineLazyPreferenceGetter(
@@ -1075,6 +1081,40 @@ window.gZenVerticalTabsManager = {
     return this.__topButtonsSeparatorElement;
   },
 
+  /**
+   * The strip items that sit below aItem and therefore have to move when its
+   * space appears or collapses.
+   *
+   * @param {Element} aItem
+   * @returns {Element[]} The elements carrying those items' space.
+   */
+  _itemsBelowInStrip(aItem) {
+    const items = gBrowser.tabContainer.ariaFocusableItems;
+    const index = items.findIndex(
+      item =>
+        !aItem.contains(item) &&
+        !!(
+          aItem.compareDocumentPosition(item) & Node.DOCUMENT_POSITION_FOLLOWING
+        )
+    );
+    if (index < 0) {
+      return [];
+    }
+    const elements = [];
+    for (const item of items.slice(index)) {
+      let element;
+      try {
+        element = ZenDragAndDrop.elementToMove(item);
+      } catch {
+        continue;
+      }
+      if (element && !elements.includes(element)) {
+        elements.push(element);
+      }
+    }
+    return elements;
+  },
+
   animateItemOpen(aItem) {
     if (
       gReduceMotion ||
@@ -1090,23 +1130,33 @@ window.gZenVerticalTabsManager = {
     ) {
       return;
     }
-    // get next visible tab
-    const isLastItem = () => {
-      const visibleItems = gBrowser.tabContainer.ariaFocusableItems;
-      return visibleItems[visibleItems.length - 1] === aItem;
-    };
-
     try {
       const itemSize =
         window.windowUtils.getBoundsWithoutFlushing(aItem).height;
-      const transform = `-${itemSize}px`;
+      const itemsBelow = this._itemsBelowInStrip(aItem);
+      for (const item of itemsBelow) {
+        item.style.transform = `translateY(-${itemSize}px)`;
+      }
+      for (const item of itemsBelow) {
+        gZenUIManager
+          .elementAnimate(
+            item,
+            { y: [-itemSize, 0] },
+            { duration: 120, easing: "ease-out" }
+          )
+          .catch(err => {
+            console.error(err);
+          })
+          .finally(() => {
+            item.style.removeProperty("transform");
+          });
+      }
       gZenUIManager.motion
         .animate(
           aItem,
           {
             opacity: [0, 1],
             transform: ["scale(0.95)", "scale(1)"],
-            marginBottom: isLastItem() ? ["0px", "0px"] : [transform, "0px"],
           },
           {
             duration: 0.12,
@@ -1118,7 +1168,6 @@ window.gZenVerticalTabsManager = {
           console.error(err);
         })
         .finally(() => {
-          aItem.style.removeProperty("margin-bottom");
           aItem.style.removeProperty("transform");
           aItem.style.removeProperty("opacity");
         });
@@ -1279,8 +1328,16 @@ window.gZenVerticalTabsManager = {
     if (gZenWorkspaces._processingResize) {
       return;
     }
+    this._pendingUrlbarFormatUpdate ||= updateFormat;
+    if (this._urlbarHeightRecalcScheduled) {
+      return;
+    }
+    this._urlbarHeightRecalcScheduled = true;
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
+        delete this._urlbarHeightRecalcScheduled;
+        const shouldUpdateFormat = this._pendingUrlbarFormatUpdate;
+        delete this._pendingUrlbarFormatUpdate;
         gURLBar.removeAttribute("--urlbar-height");
         let height;
         if (!this._hasSetSingleToolbar) {
@@ -1291,7 +1348,7 @@ window.gZenVerticalTabsManager = {
         if (typeof height !== "undefined") {
           gURLBar.style.setProperty("--urlbar-height", `${height}px`);
         }
-        if (updateFormat) {
+        if (shouldUpdateFormat) {
           gURLBar.zenFormatURLValue();
         }
       });
@@ -1404,17 +1461,36 @@ window.gZenVerticalTabsManager = {
 
       if (isSingleToolbar) {
         this._navbarParent = navBar.parentElement;
-        let elements = document.querySelectorAll(
-          '#nav-bar-customization-target > :is([cui-areatype="toolbar"], .chromeclass-toolbar-additional):not(#urlbar-container):not(toolbarspring)'
+        let elements = Array.from(
+          document.querySelectorAll(
+            '#nav-bar-customization-target > :is([cui-areatype="toolbar"], .chromeclass-toolbar-additional):not(#urlbar-container):not(toolbarspring)'
+          )
         );
-        elements = Array.from(elements).reverse();
+        let normalButtons = [];
+        let extensionButtons = [];
+        for (const element of elements) {
+          if (
+            element.hasAttribute("data-extensionid") &&
+            Services.prefs.getBoolPref("zen.view.overflow-webext-toolbar", true)
+          ) {
+            extensionButtons.push(element);
+          } else {
+            normalButtons.push(element);
+          }
+        }
         // Add separator if it doesn't exist
         if (!this._hasSetSingleToolbar) {
           buttonsTarget.append(this._topButtonsSeparatorElement);
         }
         this._hasSetSingleToolbar = true;
-        for (const button of elements) {
+        for (const button of normalButtons.reverse()) {
           this.appendCustomizableItem(this._topButtonsSeparatorElement, button);
+        }
+        for (const extension of extensionButtons) {
+          this.appendCustomizableItem(
+            this._topButtonsSeparatorElement,
+            extension
+          );
         }
         buttonsTarget.prepend(
           document.getElementById("unified-extensions-button")
@@ -1576,13 +1652,7 @@ window.gZenVerticalTabsManager = {
   },
 
   rebuildURLBarMenus() {
-    if (document.getElementById("paste-and-go")) {
-      return;
-    }
-    gURLBar._initCopyCutController();
-    gURLBar._initPasteAndGo();
-    gURLBar._initStripOnShare();
-    gURLBar._updatePlaceholderFromDefaultEngine();
+    gURLBar.updatePlaceholder();
   },
 
   rebuildAreas() {

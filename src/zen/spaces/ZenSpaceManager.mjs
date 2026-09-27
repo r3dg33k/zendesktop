@@ -13,6 +13,12 @@ ChromeUtils.defineESModuleGetters(lazy, {
   ZenSessionStore: "resource:///modules/zen/ZenSessionManager.sys.mjs",
 });
 
+ChromeUtils.defineESModuleGetters(
+  lazy,
+  { ZenLibrary: "moz-src:///zen/library/ZenLibrary.mjs" },
+  { global: "current" }
+);
+
 ChromeUtils.defineLazyGetter(lazy, "browserBackgroundElement", () => {
   return document.getElementById("zen-browser-background");
 });
@@ -75,16 +81,6 @@ class nsZenWorkspaces {
   promiseInitialized = new Promise(resolve => {
     this._resolveInitialized = resolve;
   });
-
-  async #waitForPromises() {
-    if (this.privateWindowOrDisabled) {
-      return;
-    }
-    await Promise.all([
-      this.promisePinnedInitialized,
-      SessionStore.promiseAllWindowsRestored,
-    ]);
-  }
 
   async init() {
     // Initialize workspace change mutex
@@ -152,8 +148,9 @@ class nsZenWorkspaces {
     this.addPopupListeners();
 
     if (this.privateWindowOrDisabled) {
-      await this.#waitForPromises();
-      await this.restoreWorkspacesFromSessionStore({});
+      await delayedStartupPromise;
+      this.restoreWorkspacesFromSessionStore({});
+      await this.onWindowRestored();
     }
 
     if (!this.privateWindowOrDisabled) {
@@ -300,6 +297,9 @@ class nsZenWorkspaces {
       inBackground: true,
       userContextId: 0,
       _forZenEmptyTab: true,
+      skipAnimation: true,
+      skipBackgroundNotify: true,
+      bulkOrderedOpen: true,
     });
   }
 
@@ -371,39 +371,27 @@ class nsZenWorkspaces {
       "tabbrowser-arrowscrollbox-periphery"
     );
     perifery.setAttribute("hidden", "true");
-    const tabs = gBrowser.tabContainer.allTabs;
+    const markupTabs = gBrowser.tabContainer.allTabs;
     const workspaces = this.getWorkspaces();
+    const spaceElements = document.createDocumentFragment();
     for (const workspace of workspaces) {
-      this.#createWorkspaceTabsSection(workspace, tabs);
+      spaceElements.appendChild(this.#createWorkspaceElement(workspace));
     }
-    if (tabs.length) {
-      const defaultSelectedContainer = this.workspaceElement(
-        this.activeWorkspace
-      )?.querySelector(".zen-workspace-normal-tabs-section");
-      const pinnedContainer = this.workspaceElement(
-        this.activeWorkspace
-      )?.querySelector(".zen-workspace-pinned-tabs-section");
-      // New profile with no workspaces does not have a default selected container
-      if (defaultSelectedContainer) {
-        for (const tab of tabs) {
-          if (tab.hasAttribute("zen-essential")) {
-            this.getEssentialsSection(tab).appendChild(tab);
-            continue;
-          } else if (tab.pinned) {
-            pinnedContainer.insertBefore(tab, pinnedContainer.lastChild);
-            continue;
-          }
-          // before to the last child (perifery)
-          defaultSelectedContainer.insertBefore(
-            tab,
-            defaultSelectedContainer.lastChild
-          );
-        }
-      }
+    document
+      .getElementById("tabbrowser-arrowscrollbox")
+      .appendChild(spaceElements);
+    this._hasInitializedTabsStrip = true;
+    for (const tab of markupTabs) {
+      // Routes into the active space's strip now that one exists.
+      gBrowser.tabContainer.appendChild(tab);
+    }
+    if (markupTabs.length) {
       gBrowser.tabContainer._invalidateCachedTabs();
     }
+    for (const workspace of workspaces) {
+      this.workspaceElement(workspace.uuid)?.checkPinsExistence();
+    }
     perifery.setAttribute("hidden", "true");
-    this._hasInitializedTabsStrip = true;
     this._fixIndicatorsNames(workspaces);
   }
 
@@ -432,8 +420,9 @@ class nsZenWorkspaces {
     // Set a hidden state if the essentials section is not supposed
     // to be shown on the current workspace, else remove the hidden state
     if (
-      this.containerSpecificEssentials &&
-      this.getActiveWorkspaceFromCache()?.containerTabId != container
+      this.activeWorkspace === this.creatingWorkspaceId ||
+      (this.containerSpecificEssentials &&
+        this.getActiveWorkspaceFromCache()?.containerTabId + 0 != container)
     ) {
       essentialsContainer.setAttribute("hidden", "true");
     } else {
@@ -454,15 +443,20 @@ class nsZenWorkspaces {
     return this.getEssentialsSection(this.getCurrentSpaceContainerId());
   }
 
-  #createWorkspaceTabsSection(workspace, tabs = []) {
+  #createWorkspaceElement(workspace) {
     const workspaceWrapper = document.createXULElement("zen-workspace");
-    const container = document.getElementById("tabbrowser-arrowscrollbox");
     workspaceWrapper.id = workspace.uuid;
     if (this.activeWorkspace === workspace.uuid) {
       workspaceWrapper.active = true;
     }
+    return workspaceWrapper;
+  }
 
-    container.appendChild(workspaceWrapper);
+  #createWorkspaceTabsSection(workspace, tabs = []) {
+    const workspaceWrapper = this.#createWorkspaceElement(workspace);
+    document
+      .getElementById("tabbrowser-arrowscrollbox")
+      .appendChild(workspaceWrapper);
     this.#organizeTabsToWorkspaceSections(workspace, workspaceWrapper, tabs);
     workspaceWrapper.checkPinsExistence();
   }
@@ -509,6 +503,85 @@ class nsZenWorkspaces {
         section.insertBefore(tab, section.firstChild);
       }
     }
+  }
+
+  /** @type {Map<Element, DocumentFragment>|null} */
+  #sessionRestoreFragments = null;
+
+  get canCollectSessionRestoreFragments() {
+    return (
+      this._hasInitializedTabsStrip &&
+      !!this.activeWorkspaceElement?.tabsContainer
+    );
+  }
+
+  beginSessionRestoreFragments() {
+    this.#sessionRestoreFragments = new Map();
+  }
+
+  /**
+   * @param {object} aTabData
+   *        Session store data of the tab, or of the first tab of the folder,
+   *        that is about to be inserted.
+   * @returns {DocumentFragment} The fragment for the section it belongs to.
+   */
+  getSessionRestoreFragment(aTabData) {
+    const container = this.#sessionRestoreContainer(aTabData);
+    let fragment = this.#sessionRestoreFragments.get(container);
+    if (!fragment) {
+      fragment = document.createDocumentFragment();
+      this.#sessionRestoreFragments.set(container, fragment);
+    }
+    return fragment;
+  }
+
+  /**
+   * Inserts every collected fragment into its section, one insertion per
+   * section instead of one move per restored tab.
+   */
+  flushSessionRestoreFragments() {
+    if (!this.#sessionRestoreFragments) {
+      return;
+    }
+    const filledSpaces = new Set();
+    for (const [container, fragment] of this.#sessionRestoreFragments) {
+      container.insertBefore(fragment, this.#sessionRestoreAnchor(container));
+      const spaceElement = container.closest("zen-workspace");
+      if (spaceElement) {
+        filledSpaces.add(spaceElement);
+      }
+    }
+    this.#sessionRestoreFragments = null;
+    for (const spaceElement of filledSpaces) {
+      spaceElement.checkPinsExistence();
+    }
+    gBrowser.tabContainer._invalidateCachedTabs();
+  }
+
+  #sessionRestoreContainer(aTabData) {
+    if (aTabData.zenEssential) {
+      return this.getEssentialsSection(aTabData.userContextId);
+    }
+    let spaceElement = this.workspaceElement(aTabData.zenWorkspace);
+    if (!spaceElement?.tabsContainer) {
+      // The space is gone, or the tab never had one. Keep it in the active
+      // space, #clearAnyZombieTabs takes care of it later on if need be.
+      spaceElement = this.activeWorkspaceElement;
+    }
+    return aTabData.pinned
+      ? spaceElement.pinnedTabsContainer
+      : spaceElement.tabsContainer;
+  }
+
+  #sessionRestoreAnchor(aContainer) {
+    // Essentials are shared between spaces, so a restore only ever adds to
+    // what is already there. Every other section gets the restored tabs in
+    // front of whatever the window started with, which is the tab the startup
+    // page opened with and which belongs at the end.
+    if (aContainer.classList.contains("zen-essentials-container")) {
+      return null;
+    }
+    return aContainer.firstChild;
   }
 
   initializeWorkspaceNavigation() {
@@ -756,6 +829,9 @@ class nsZenWorkspaces {
       : [this.#createWorkspaceData("Space", undefined)];
     this.activeWorkspace =
       aWinData.activeZenSpace || this._workspaceCache[0].uuid;
+    if (aWinData.selected) {
+      this._sessionSelected = aWinData.selected;
+    }
     let promise = this.#initializeWorkspaces();
     for (const workspace of spacesFromStore) {
       const element = this.workspaceElement(workspace.uuid);
@@ -792,47 +868,75 @@ class nsZenWorkspaces {
       console.error("gZenWorkspaces: Error initializing theme picker", e);
     }
     this.#initializeTabsStripSections();
+    return this.promiseInitialized;
+  }
+
+  #hasFinishedInitialization = false;
+
+  async onWindowRestored() {
+    if (this.#hasFinishedInitialization || !this.workspaceEnabled) {
+      return;
+    }
+    this.#hasFinishedInitialization = true;
+    const activeWorkspace = this.getActiveWorkspace();
+    if (!this.privateWindowOrDisabled) {
+      await this.promisePinnedInitialized;
+    }
     this.#initializeEmptyTab();
-    return (async () => {
-      await this.#waitForPromises();
-      this.#afterLoadInit();
-      await this.#initializeWorkspaceBookmarks();
-      await this.changeWorkspace(activeWorkspace, { onInit: true });
-      this.#fixTabPositions();
-      this.onWindowResize();
-      this._resolveInitialized();
-      this.#clearAnyZombieTabs(); // Dont call with await
-      delete this._resolveInitialized;
+    this.#afterLoadInit();
+    await this.#initializeWorkspaceBookmarks();
+    await this.changeWorkspace(activeWorkspace, { onInit: true });
+    this.#fixTabPositions();
+    this.onWindowResize();
+    // The spaces hold their tabs now, so the tab the user is waiting for can
+    // be selected without waiting on anything else.
+    try {
+      await this.selectStartPage();
+    } catch (e) {
+      console.error("gZenWorkspaces: Error selecting the start page", e);
+    }
+    this._resolveInitialized();
+    this.#clearAnyZombieTabs(); // Dont call with await
+    delete this._resolveInitialized;
 
-      const tabUpdateListener = this.updateTabsContainers.bind(this);
-      window.addEventListener("TabOpen", tabUpdateListener);
-      window.addEventListener("TabClose", tabUpdateListener);
-      window.addEventListener("TabAddedToEssentials", tabUpdateListener);
-      window.addEventListener("TabRemovedFromEssentials", tabUpdateListener);
-      window.addEventListener("TabPinned", tabUpdateListener);
-      window.addEventListener("TabUnpinned", tabUpdateListener);
-      window.addEventListener("aftercustomization", tabUpdateListener);
-      window.addEventListener("TabSelect", this.onLocationChange.bind(this));
-      window.addEventListener(
-        "TabBrowserInserted",
-        this.onTabBrowserInserted.bind(this)
-      );
+    const tabUpdateListener = this.updateTabsContainers.bind(this);
+    window.addEventListener("TabOpen", tabUpdateListener);
+    window.addEventListener("TabClose", tabUpdateListener);
+    window.addEventListener("TabAddedToEssentials", tabUpdateListener);
+    window.addEventListener("TabRemovedFromEssentials", tabUpdateListener);
+    window.addEventListener("TabPinned", tabUpdateListener);
+    window.addEventListener("TabUnpinned", tabUpdateListener);
+    window.addEventListener("aftercustomization", tabUpdateListener);
+    window.addEventListener("TabSelect", this.onLocationChange.bind(this));
+    window.addEventListener(
+      "TabBrowserInserted",
+      this.onTabBrowserInserted.bind(this)
+    );
 
-      this.updateWorkspacesChangeContextMenu();
-    })();
+    this.updateWorkspacesChangeContextMenu();
   }
 
   async selectStartPage() {
-    if (!this.workspaceEnabled || gZenUIManager.testingEnabled) {
+    if (
+      !this.workspaceEnabled ||
+      gZenUIManager.testingEnabled ||
+      this.#hasSelectedStartPage
+    ) {
       return;
     }
-    await this.promiseInitialized;
+    // #hasInitialized only goes up once the whole init promise settles, so a
+    // second restore arriving before that would otherwise run this again.
+    this.#hasSelectedStartPage = true;
+    // _handleURIToLoad selects the tab it loads the startup URI into, so
+    // picking ours before delayed startup is done just gets overwritten.
+    await delayedStartupPromise;
     let resolveSelectPromise;
     let selectPromise = new Promise(resolve => {
       resolveSelectPromise = resolve;
     });
 
     const cleanup = () => {
+      delete this._sessionSelected;
       delete this._tabToSelect;
       delete this._tabToRemoveForEmpty;
       delete this._shouldOverrideTabs;
@@ -862,6 +966,11 @@ class nsZenWorkspaces {
     ) {
       const tabs = gBrowser.tabs.filter(tab => !tab.collapsed);
       if (
+        Services.prefs.getBoolPref("zen.workspaces.continue-where-left-off")
+      ) {
+        this._tabToSelect = this._sessionSelected - 1;
+      }
+      if (
         typeof this._tabToSelect === "number" &&
         this._tabToSelect >= 0 &&
         tabs[this._tabToSelect] &&
@@ -872,7 +981,7 @@ class nsZenWorkspaces {
       ) {
         this.log(`Found tab to select: ${this._tabToSelect}, ${tabs.length}`);
         let tabToUse = gZenGlanceManager.getTabOrGlanceParent(
-          tabs[this._tabToSelect + 1] || this._emptyTab
+          tabs[this._tabToSelect] || this._emptyTab
         );
         gBrowser.selectedTab = tabToUse;
         this._removedByStartupPage = true;
@@ -911,8 +1020,12 @@ class nsZenWorkspaces {
 
     // Wait for the next event loop to ensure that the startup focus logic by
     // firefox has finished doing it's thing.
-    setTimeout(() => {
-      if (document.documentElement.hasAttribute("zen-welcome-stage")) {
+    const focusTimer = setTimeout(() => {
+      if (
+        window.closed ||
+        !window.docShell ||
+        document.documentElement.hasAttribute("zen-welcome-stage")
+      ) {
         return;
       }
       if (gZenVerticalTabsManager._canReplaceNewTab && shownEmptyTab) {
@@ -922,6 +1035,11 @@ class nsZenWorkspaces {
       } else {
         gBrowser.selectedBrowser.focus();
       }
+    });
+    // A window torn down before this runs would leave the focus work in
+    // flight against a destroyed urlbar.
+    window.addEventListener("unload", () => clearTimeout(focusTimer), {
+      once: true,
     });
 
     if (
@@ -950,6 +1068,8 @@ class nsZenWorkspaces {
       new CustomEvent("AfterWorkspacesSessionRestore", { bubbles: true })
     );
   }
+
+  #hasSelectedStartPage = false;
 
   handleInitialTab(tab, isEmpty) {
     if (gZenUIManager.testingEnabled || !this.workspaceEnabled) {
@@ -1772,10 +1892,10 @@ class nsZenWorkspaces {
     if (this.tabContainer) {
       this.tabContainer._invalidateCachedTabs();
     }
-    // Fix tabs _tPos values relative to the actual order
+    // Fix tabs _index values relative to the actual order
     const tabs = gBrowser.tabs;
     const usedGroups = new Set();
-    let tPos = 0; // _tPos is used for the session store, not needed for folders
+    let tPos = 0; // _index is used for the session store, not needed for folders
     let pPos = 0; // _pPos is used for the pinned tabs manager
     const recurseFolder = tab => {
       if (tab.group) {
@@ -1788,7 +1908,7 @@ class nsZenWorkspaces {
     };
     for (const tab of tabs) {
       recurseFolder(tab);
-      tab._tPos = tPos++;
+      tab._index = tPos++;
       if (!tab.hasAttribute("zen-empty-tab")) {
         tab._pPos = pPos++;
       }
@@ -1816,6 +1936,16 @@ class nsZenWorkspaces {
       requestAnimationFrame(() => {
         workspaceElement.style.paddingTop = essentialsHeight + "px";
       });
+    }
+  }
+
+  #setAnimatingBackground(animating) {
+    for (const element of [
+      lazy.browserBackgroundElement,
+      lazy.toolbarBackgroundElement,
+      gNavToolbox,
+    ]) {
+      element.toggleAttribute("animating-background", animating);
     }
   }
 
@@ -1916,7 +2046,7 @@ class nsZenWorkspaces {
             "--zen-main-browser-background-toolbar-old",
             nextToolbarGradient
           );
-          document.documentElement.setAttribute("animating-background", "true");
+          this.#setAnimatingBackground(true);
         }
         // Fit the offsetPixels into the grain limits. Both ends may be nextGrain and existingGrain,
         // so we need to use the min and max of both. For example, existing may be 0.2 and next may be 0.5,
@@ -1939,36 +2069,13 @@ class nsZenWorkspaces {
   }
 
   /**
-   * Slide the essentials back from wherever a creation form parked them.
+   * Drop the offset a creation form parked the essentials at.
    */
-  restoreEssentialsPosition() {
-    const duration =
-      Services.prefs.getIntPref("zen.workspaces.switch-animation-duration") /
-      1000;
+  resetEssentialsPosition() {
     for (const container of document.querySelectorAll(
       "#zen-essentials .zen-essentials-container"
     )) {
-      const existingTransform = container.style.transform;
-      const parkedOffset = parseFloat(existingTransform.split("(")[1]) || 0;
-      if (!parkedOffset || gReduceMotion) {
-        container.style.removeProperty("transform");
-        continue;
-      }
-      gZenUIManager.motion
-        .animate(
-          container,
-          {
-            transform: [existingTransform, "translateX(0%)"],
-          },
-          {
-            type: "spring",
-            bounce: 0,
-            duration,
-          }
-        )
-        .then(() => {
-          container.style.removeProperty("transform");
-        });
+      container.style.removeProperty("transform");
     }
   }
 
@@ -2064,7 +2171,7 @@ class nsZenWorkspaces {
         });
       }
     }
-    document.documentElement.setAttribute("animating-background", "true");
+    this.#setAnimatingBackground(true);
     if (shouldAnimate && previousWorkspace) {
       let previousBackgroundOpacity =
         lazy.browserBackgroundElement.style.getPropertyValue(
@@ -2236,7 +2343,7 @@ class nsZenWorkspaces {
       console.error
     );
     this.#currentSpaceSwitchContext.animations = [];
-    document.documentElement.removeAttribute("animating-background");
+    this.#setAnimatingBackground(false);
     if (shouldAnimate) {
       for (const data of essentialsAnimData) {
         if (this.creatingWorkspaceId && data.finalOffset) {
@@ -2364,9 +2471,13 @@ class nsZenWorkspaces {
       )
     ) {
       tabToSelect = lastSelectedTab;
+    } else if (!onInit && !tabToSelect) {
+      // Create new tab if needed and no suitable tab was found
+      tabToSelect = this._emptyTab;
     }
     // Find first suitable tab
-    else {
+    // If we found a tab to select, select it
+    if (!tabToSelect || tabToSelect.closing) {
       tabToSelect = gBrowser.visibleTabs.find(tab => !tab.pinned);
       if (!tabToSelect && gBrowser.visibleTabs.length) {
         tabToSelect = gBrowser.visibleTabs[gBrowser.visibleTabs.length - 1];
@@ -2377,12 +2488,6 @@ class nsZenWorkspaces {
       }
     }
 
-    // If we found a tab to select, select it
-    if (!onInit && !tabToSelect) {
-      // Create new tab if needed and no suitable tab was found
-      const newTab = this.selectEmptyTab();
-      tabToSelect = newTab;
-    }
     if (tabToSelect && !onInit) {
       tabToSelect._visuallySelected = true;
     }
@@ -2567,13 +2672,15 @@ class nsZenWorkspaces {
   #createWorkspaceData(name, icon, containerTabId = 0) {
     if (!this.currentWindowIsSyncing) {
       containerTabId =
-        parseInt(gBrowser.selectedTab.getAttribute("usercontextid")) || 0;
+        parseInt(
+          globalThis.gBrowser?.selectedTab?.getAttribute("usercontextid")
+        ) || 0;
       let label =
         ContextualIdentityService.getUserContextLabel(containerTabId) ||
         "Default";
       name = this.isPrivateWindow ? "Incognito" : label;
       if (this.isPrivateWindow) {
-        icon = gZenEmojiPicker.getSVGURL("eye.svg");
+        icon = "chrome://browser/skin/zen-icons/private-window-small.svg";
       }
     }
     let workspace = {
@@ -2705,6 +2812,7 @@ class nsZenWorkspaces {
   onPinnedTabsResize(entries, forAnimation = false) {
     if (
       document.documentElement.hasAttribute("inDOMFullscreen") ||
+      lazy.ZenLibrary.isLibrarySlightlyOpen ||
       !this._hasInitializedTabsStrip ||
       (this._organizingWorkspaceStrip && !forAnimation) ||
       document.documentElement.hasAttribute("zen-creating-workspace") ||
@@ -2913,6 +3021,12 @@ class nsZenWorkspaces {
     });
   }
 
+  contextShareWorkspace() {
+    const workspaceId =
+      this.#contextMenuData?.workspaceId || this.activeWorkspace;
+    gZenShareManager.shareSpace(workspaceId);
+  }
+
   async contextDeleteWorkspace() {
     const workspaceId =
       this.#contextMenuData?.workspaceId || this.activeWorkspace;
@@ -2929,7 +3043,10 @@ class nsZenWorkspaces {
   }
 
   findTabToBlur(tab) {
-    if ((!this._shouldChangeToTab(tab) || !tab) && this._emptyTab) {
+    if (
+      (!tab || !this._shouldChangeToTab(tab) || !gBrowser.tabs.includes(tab)) &&
+      this._emptyTab
+    ) {
       return this._emptyTab;
     }
     return tab;
@@ -3041,7 +3158,6 @@ class nsZenWorkspaces {
   getTabsToExclude(aTab) {
     const tabWorkspaceId = aTab.getAttribute("zen-workspace-id");
     const containerId = aTab.getAttribute("usercontextid") ?? "0";
-    // Return all tabs that are not on the same workspace
     return gBrowser.tabs.filter(
       tab =>
         !this._shouldShowTab(
@@ -3306,7 +3422,7 @@ class nsZenWorkspaces {
     if (!(!event || event.target === window)) {
       return;
     }
-    gZenUIManager.updateTabsToolbar();
+    gZenUIManager.updateTabsToolbar(!!event);
     // Check if workspace icons overflow the parent container
     let parent = this.workspaceIcons;
     if (!parent || this._processingResize) {
@@ -3321,7 +3437,7 @@ class nsZenWorkspaces {
       parent.removeAttribute("icons-overflow");
       return;
     }
-    const maxButtonSize = 32; // IMPORTANT: This should match the CSS size of the icons
+    const maxButtonSize = AppConstants.platform == "macosx" ? 34 : 32; // IMPORTANT: This should match the CSS size of the icons
     const minButtonSize = maxButtonSize / 2; // Minimum size for icons when space is limited
     const separation = 3; // Space between icons
 
