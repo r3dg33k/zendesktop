@@ -1,96 +1,146 @@
-name: Cachy-OS/ryzen Compile Optimized Zen Browser
+name: CachyOS / Ryzen 5900 (znver3) – Zen Browser
 
 on:
-  workflow_dispatch: # Allows you to trigger the build manually
+  workflow_dispatch:
 
 jobs:
   build:
-    name: Build Zen (${{ matrix.target_name }})
-    # Use GitHub's free cloud infrastructure
+    name: Build Zen – CachyOS-Ryzen-5900-znver3
     runs-on: ubuntu-24.04
-    
-    # Isolate the entire build environment inside a rolling-release CachyOS container
+
     container:
       image: cachyos/cachyos:latest
+      options: --privileged
 
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target_name: "CachyOS-Ryzen-5900-znver3"
-            march_flag: "znver3"
-            mtune_flag: "znver3"
-            cflags_extra: "-O3 -flto=thin -fno-plt -pipe"
+    env:
+      MARCH: znver3
+      MTUNE: znver3
+      EXTRA_FLAGS: "-O3 -flto=thin -fno-plt -pipe"
+      SURFER_PLATFORM: linux
+      SURFER_COMPAT: x86_64
+      ZEN_RELEASE: 1
+      # Tell cargo/mach to use the in-container clang/lld
+      CC: clang
+      CXX: clang++
+      AR: llvm-ar
+      RANLIB: llvm-ranlib
 
     steps:
-      - name: System Dependencies & Toolchain (CachyOS Pacman)
+      # ── 1. System deps ────────────────────────────────────────────────────
+      - name: Install system dependencies (pacman)
         run: |
-          # Sync rolling-release mirrors and install compilation requirements natively
           pacman -Syu --noconfirm
-          pacman -S --noconfirm --needed base-devel git curl python nodejs npm yasm \
-            alsa-lib dbus glib2 gtk3 libpulse libx11 libxt mesa clamav
+          pacman -S --noconfirm --needed \
+            base-devel git curl python python-pip \
+            nodejs npm yasm nasm \
+            alsa-lib dbus glib2 gtk2 gtk3 \
+            libpulse libx11 libxt libxcb mesa \
+            lld llvm clang \
+            m4 uuid xorg-server-xvfb \
+            dos2unix
 
-      - name: Checkout Source
+      # ── 2. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout source
         uses: actions/checkout@v4
         with:
-          fetch-depth: 10
+          fetch-depth: 1
 
-      - name: Install Native Rust Toolchain
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://rustup.rs | sh -s -- -y --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          export PATH="$HOME/.cargo/bin:$PATH"
+      # ── 3. Node (respect .nvmrc = 22) ─────────────────────────────────────
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
 
-      - name: Setup Node Package Manager (pnpm)
+      # ── 4. pnpm / surfer ──────────────────────────────────────────────────
+      - name: Enable pnpm via corepack
         run: |
           npm install -g corepack
           corepack enable
           corepack prepare pnpm@latest --activate
 
-      - name: Install Node Dependencies
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Install @zen-browser/surfer globally
+        run: npm install -g @zen-browser/surfer
+
+      # ── 5. Rust (pin to .rust-toolchain) ─────────────────────────────────
+      - name: Install pinned Rust toolchain
         run: |
-          echo "block-exotic-subdeps=true" >> .npmrc
-          echo "minimum-release-age=0" >> .npmrc
-          pnpm install --no-frozen-lockfile
+          RUST_VER=$(cat .rust-toolchain)
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --default-toolchain "${RUST_VER}"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Initialize Browser Engine
-        run: pnpm run init
-
-      - name: Inject Ryzen 5900 (Zen 3) Optimization Environment
-        env:
-          MARCH: ${{ matrix.march_flag }}
-          MTUNE: ${{ matrix.mtune_flag }}
-          EXTRA_FLAGS: ${{ matrix.cflags_extra }}
+      # ── 6. Surfer CI bootstrap (sets display-version / brand meta) ─────────
+      - name: Activate Surfer CI (twilight brand)
         run: |
-          MOZCONFIG_PATH="configs/linux/mozconfig"
-          
-          if [ -f "$MOZCONFIG_PATH" ]; then
-            echo "Injecting targeted compiler variables into $MOZCONFIG_PATH..."
-            BUILD_CFLAGS="-march=${MARCH} -mtune=${MTUNE} ${EXTRA_FLAGS}"
-            
-            echo "export CFLAGS=\"\$CFLAGS ${BUILD_CFLAGS}\"" >> "$MOZCONFIG_PATH"
-            echo "export CXXFLAGS=\"\$CXXFLAGS ${BUILD_CFLAGS}\"" >> "$MOZCONFIG_PATH"
-            
-            if [[ "${EXTRA_FLAGS}" == *"-flto"* ]]; then
-              echo "export RUSTFLAGS=\"\$RUSTFLAGS -C linker-plugin-lto -C target-cpu=${MARCH}\"" >> "$MOZCONFIG_PATH"
-            fi
-            
-            cat "$MOZCONFIG_PATH"
-          else
-            echo "ac_add_options --enable-optimize=\"-march=${MARCH} -mtune=${MTUNE} ${EXTRA_FLAGS}\"" >> .mozconfig
-          fi
+          source "$HOME/.cargo/env"
+          npm run surfer -- ci --brand twilight
 
-      - name: Compile Zen Browser
-        run: pnpm run build
+      # ── 7. Download Firefox source tarball ───────────────────────────────
+      - name: Download Firefox source
+        run: npm run download
 
-      - name: Package Output Binaries
+      # ── 8. Inject Ryzen 5900 (znver3) flags into mozconfig ───────────────
+      - name: Inject znver3 optimisation flags
         run: |
-          mkdir -p final-artifacts
-          find dist/ firefox-dev/ obj-*/dist/ -name "zen*.tar.xz" -o -name "zen*.tar.bz2" -exec cp {} final-artifacts/ \; || true
+          MOZCONFIG="configs/linux/mozconfig"
+          BUILD_FLAGS="-march=${MARCH} -mtune=${MTUNE} ${EXTRA_FLAGS}"
 
-      - name: Upload Native CachyOS Artifacts
+          cat >> "${MOZCONFIG}" << EOF
+
+          # ── CachyOS / Ryzen 5900 (znver3) custom flags ──
+          export CFLAGS="\${CFLAGS} ${BUILD_FLAGS}"
+          export CXXFLAGS="\${CXXFLAGS} ${BUILD_FLAGS}"
+          export RUSTFLAGS="\${RUSTFLAGS} -C target-cpu=${MARCH} -C linker-plugin-lto"
+
+          # Use system lld (already set by configs/linux/mozconfig for releases,
+          # but make it explicit here so it's not overridden by a debug fallback)
+          ac_add_options --enable-linker=lld
+          EOF
+
+          echo "=== final mozconfig ==="
+          cat "${MOZCONFIG}"
+
+      # ── 9. Import Zen patches into the Firefox engine tree ────────────────
+      - name: Import Zen patches
+        run: |
+          source "$HOME/.cargo/env"
+          npm run import
+
+      # ── 10. Build language packs ──────────────────────────────────────────
+      - name: Download language packs
+        run: sh scripts/download-language-packs.sh
+
+      # ── 11. Bootstrap Mozilla build system ───────────────────────────────
+      - name: Bootstrap mach
+        run: |
+          source "$HOME/.cargo/env"
+          cd engine
+          ./mach --no-interactive bootstrap --application-choice browser
+
+      # ── 12. Build ─────────────────────────────────────────────────────────
+      - name: Build Zen Browser
+        run: |
+          source "$HOME/.cargo/env"
+          bash .github/workflows/src/release-build.sh
+
+      # ── 13. Package ───────────────────────────────────────────────────────
+      - name: Package
+        run: |
+          source "$HOME/.cargo/env"
+          npm run package
+
+      # ── 14. Rename & upload ───────────────────────────────────────────────
+      - name: Rename artifact
+        run: |
+          mv dist/zen-*.tar.xz zen.linux-x86_64-znver3.tar.xz || \
+          find dist/ -name "*.tar.*" -exec mv {} zen.linux-x86_64-znver3.tar.xz \;
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Zen-Browser-${{ matrix.target_name }}
-          path: final-artifacts/
-          if-no-files-found: warn
+          name: Zen-Browser-CachyOS-Ryzen-5900-znver3
+          path: zen.linux-x86_64-znver3.tar.xz
+          if-no-files-found: error
