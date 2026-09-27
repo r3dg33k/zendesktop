@@ -38,19 +38,44 @@ jobs:
             m4 xorg-server-xvfb \
             dos2unix
 
-      # ── 2. Checkout ───────────────────────────────────────────────────────
+      # ── 2. Fix git safe.directory ─────────────────────────────────────────
+      # GitHub Actions runs the container as a different UID than the one that
+      # owns /__w/. Git 2.35.2+ refuses to operate in such directories unless
+      # they are explicitly marked safe. surfer build calls `git rev-parse HEAD`
+      # in the workspace root and crashes with exit 128 without this.
+      - name: Mark workspace as git safe directory
+        run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          git config --global --add safe.directory "/__w/zendesktop/zendesktop"
+          git config --global --add safe.directory "*"
+
+      # ── 3. Checkout ───────────────────────────────────────────────────────
       - name: Checkout source
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # ── 3. Node (respect .nvmrc = 22) ─────────────────────────────────────
+      # ── 4. Seed workspace git history ─────────────────────────────────────
+      # surfer build calls `git rev-parse HEAD` in the workspace root.
+      # actions/checkout with fetch-depth: 1 gives a shallow clone that has
+      # HEAD, but inside a container the UID mismatch (fixed above) can still
+      # leave git confused. We also need at least one real commit so surfer's
+      # version-control check doesn't warn and bail.
+      - name: Ensure workspace git identity
+        run: |
+          git config user.email "ci@localhost"
+          git config user.name  "CI"
+          # Verify git can read HEAD in the workspace (will catch any remaining
+          # safe.directory issues before we get deep into the build)
+          git rev-parse HEAD
+
+      # ── 5. Node (respect .nvmrc = 22) ─────────────────────────────────────
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version-file: ".nvmrc"
 
-      # ── 4. pnpm / surfer ──────────────────────────────────────────────────
+      # ── 6. pnpm / surfer ──────────────────────────────────────────────────
       - name: Enable pnpm via corepack
         run: |
           npm install -g corepack
@@ -63,7 +88,7 @@ jobs:
       - name: Install @zen-browser/surfer globally
         run: npm install -g @zen-browser/surfer
 
-      # ── 5. Rust (pin to .rust-toolchain) ─────────────────────────────────
+      # ── 7. Rust (pin to .rust-toolchain) ─────────────────────────────────
       - name: Install pinned Rust toolchain
         run: |
           RUST_VER=$(cat .rust-toolchain)
@@ -71,22 +96,21 @@ jobs:
             sh -s -- -y --default-toolchain "${RUST_VER}"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # ── 6. Surfer CI bootstrap ────────────────────────────────────────────
-      # NOTE: Do NOT run `surfer update` here. The version in surfer.json
-      # (e.g. 154.0.1) is intentionally frozen to match the patches in src/.
-      # Bumping Firefox without rebasing the patches causes `git apply` to
-      # fail on hunks like navigator-toolbox-inc-xhtml.patch. Only bump the
-      # pin locally (surfer update → fix conflicts → surfer export → commit).
+      # ── 8. Surfer CI bootstrap ────────────────────────────────────────────
+      # Do NOT run `surfer update` here. The version in surfer.json is frozen
+      # to match the patches in src/. Bumping Firefox without rebasing patches
+      # causes `git apply` to fail. Bump locally instead:
+      #   surfer update → fix conflicts → surfer export → commit & push.
       - name: Activate Surfer CI (twilight brand)
         run: |
           source "$HOME/.cargo/env"
           npm run surfer -- ci --brand twilight
 
-      # ── 7. Download Firefox source tarball (frozen version) ───────────────
+      # ── 9. Download Firefox source tarball (frozen version) ───────────────
       - name: Download Firefox source
         run: npm run download
 
-      # ── 8. Inject Ryzen 5900 (znver3) flags into mozconfig ───────────────
+      # ── 10. Inject Ryzen 5900 (znver3) flags into mozconfig ──────────────
       - name: Inject znver3 optimisation flags
         run: |
           MOZCONFIG="configs/linux/mozconfig"
@@ -105,48 +129,49 @@ jobs:
           echo "=== final mozconfig ==="
           cat "${MOZCONFIG}"
 
-      # ── 9. Import Zen patches into the Firefox engine tree ────────────────
+      # ── 11. Import Zen patches into the Firefox engine tree ───────────────
       - name: Import Zen patches
         run: |
           source "$HOME/.cargo/env"
           npm run import
 
-      # ── 10. Build language packs ──────────────────────────────────────────
+      # ── 12. Build language packs ──────────────────────────────────────────
       - name: Download language packs
         run: sh scripts/download-language-packs.sh
 
-      # ── 11. Seed engine git history ───────────────────────────────────────
+      # ── 13. Seed engine git history ───────────────────────────────────────
       # mach bootstrap runs `git log -1 --format=%ct` inside engine/ to check
       # commit age. After `npm run import` the branch has no commits so git
       # exits 128 and mach crashes. One dummy commit satisfies the check.
       - name: Seed engine git history
         run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}/engine"
           cd engine
           git config user.email "ci@localhost"
           git config user.name  "CI"
           git add -A
           git commit --allow-empty -m "chore: seed engine tree for mach bootstrap"
 
-      # ── 12. Bootstrap Mozilla build system ───────────────────────────────
+      # ── 14. Bootstrap Mozilla build system ───────────────────────────────
       - name: Bootstrap mach
         run: |
           source "$HOME/.cargo/env"
           cd engine
           ./mach --no-interactive bootstrap --application-choice browser
 
-      # ── 13. Build ─────────────────────────────────────────────────────────
+      # ── 15. Build ─────────────────────────────────────────────────────────
       - name: Build Zen Browser
         run: |
           source "$HOME/.cargo/env"
           bash .github/workflows/src/release-build.sh
 
-      # ── 14. Package ───────────────────────────────────────────────────────
+      # ── 16. Package ───────────────────────────────────────────────────────
       - name: Package
         run: |
           source "$HOME/.cargo/env"
           npm run package
 
-      # ── 15. Rename & upload ───────────────────────────────────────────────
+      # ── 17. Rename & upload ───────────────────────────────────────────────
       - name: Rename artifact
         run: |
           mv dist/zen-*.tar.xz zen.linux-x86_64-znver3.tar.xz || \
