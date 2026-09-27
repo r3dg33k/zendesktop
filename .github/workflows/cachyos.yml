@@ -1,15 +1,18 @@
-name: CachyOS-Ryzen Compile Optimized Zen Browser
+name: Cachy-OS/ryzen Compile Optimized Zen Browser
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # Allows you to trigger the build manually
 
 jobs:
   build:
     name: Build Zen (${{ matrix.target_name }})
+    # Use GitHub's free cloud infrastructure
     runs-on: ubuntu-24.04
-    # Run everything inside a modern Arch-based container for glibc and toolchain matching
+    
+    # Isolate the entire build environment inside a rolling-release CachyOS container
     container:
-      image: archlinux:latest
+      image: cachyos/cachyos:latest
+
     strategy:
       fail-fast: false
       matrix:
@@ -20,9 +23,9 @@ jobs:
             cflags_extra: "-O3 -flto=thin -fno-plt -pipe"
 
     steps:
-      - name: Initialize Arch/CachyOS Toolchain & System Dependencies
+      - name: System Dependencies & Toolchain (CachyOS Pacman)
         run: |
-          # Update repositories and install foundational Arch build packages
+          # Sync rolling-release mirrors and install compilation requirements natively
           pacman -Syu --noconfirm
           pacman -S --noconfirm --needed base-devel git curl python nodejs npm yasm \
             alsa-lib dbus glib2 gtk3 libpulse libx11 libxt mesa clamav
@@ -32,14 +35,13 @@ jobs:
         with:
           fetch-depth: 10
 
-      - name: Install Rust (via rustup for Arch compatibility)
+      - name: Install Native Rust Toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          # Ensure environment updates immediately for subsequent steps
           export PATH="$HOME/.cargo/bin:$PATH"
 
-      - name: Install Corepack & pnpm
+      - name: Setup Node Package Manager (pnpm)
         run: |
           npm install -g corepack
           corepack enable
@@ -51,10 +53,10 @@ jobs:
           echo "minimum-release-age=0" >> .npmrc
           pnpm install --no-frozen-lockfile
 
-      - name: Initialize & Bootstrap Browser Engine
+      - name: Initialize Browser Engine
         run: pnpm run init
 
-      - name: Inject CachyOS & Ryzen 5900 Compiler Optimizations
+      - name: Inject Ryzen 5900 (Zen 3) Optimization Environment
         env:
           MARCH: ${{ matrix.march_flag }}
           MTUNE: ${{ matrix.mtune_flag }}
@@ -63,9 +65,7 @@ jobs:
           MOZCONFIG_PATH="configs/linux/mozconfig"
           
           if [ -f "$MOZCONFIG_PATH" ]; then
-            echo "Injecting target microarchitecture flags into $MOZCONFIG_PATH..."
-            
-            # Using ThinLTO (-flto=thin) which works remarkably well with modern Clang/GCC on Zen 3
+            echo "Injecting targeted compiler variables into $MOZCONFIG_PATH..."
             BUILD_CFLAGS="-march=${MARCH} -mtune=${MTUNE} ${EXTRA_FLAGS}"
             
             echo "export CFLAGS=\"\$CFLAGS ${BUILD_CFLAGS}\"" >> "$MOZCONFIG_PATH"
@@ -75,7 +75,6 @@ jobs:
               echo "export RUSTFLAGS=\"\$RUSTFLAGS -C linker-plugin-lto -C target-cpu=${MARCH}\"" >> "$MOZCONFIG_PATH"
             fi
             
-            echo "--- Modified Mozconfig ---"
             cat "$MOZCONFIG_PATH"
           else
             echo "ac_add_options --enable-optimize=\"-march=${MARCH} -mtune=${MTUNE} ${EXTRA_FLAGS}\"" >> .mozconfig
@@ -84,12 +83,12 @@ jobs:
       - name: Compile Zen Browser
         run: pnpm run build
 
-      - name: Package Output
+      - name: Package Output Binaries
         run: |
           mkdir -p final-artifacts
           find dist/ firefox-dev/ obj-*/dist/ -name "zen*.tar.xz" -o -name "zen*.tar.bz2" -exec cp {} final-artifacts/ \; || true
 
-      - name: Upload Optimized Artifacts
+      - name: Upload Native CachyOS Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Zen-Browser-${{ matrix.target_name }}
