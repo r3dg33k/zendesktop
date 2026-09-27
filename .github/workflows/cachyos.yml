@@ -19,7 +19,6 @@ jobs:
       SURFER_PLATFORM: linux
       SURFER_COMPAT: x86_64
       ZEN_RELEASE: 1
-      # Tell cargo/mach to use the in-container clang/lld
       CC: clang
       CXX: clang++
       AR: llvm-ar
@@ -39,7 +38,7 @@ jobs:
             m4 xorg-server-xvfb \
             dos2unix
 
-      # ── 2. Checkout ────────────────────────────────────────────────────────
+      # ── 2. Checkout ───────────────────────────────────────────────────────
       - name: Checkout source
         uses: actions/checkout@v4
         with:
@@ -72,24 +71,22 @@ jobs:
             sh -s -- -y --default-toolchain "${RUST_VER}"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # ── 6. Surfer CI bootstrap (sets display-version / brand meta) ────────
+      # ── 6. Surfer CI bootstrap ────────────────────────────────────────────
+      # NOTE: Do NOT run `surfer update` here. The version in surfer.json
+      # (e.g. 154.0.1) is intentionally frozen to match the patches in src/.
+      # Bumping Firefox without rebasing the patches causes `git apply` to
+      # fail on hunks like navigator-toolbox-inc-xhtml.patch. Only bump the
+      # pin locally (surfer update → fix conflicts → surfer export → commit).
       - name: Activate Surfer CI (twilight brand)
         run: |
           source "$HOME/.cargo/env"
           npm run surfer -- ci --brand twilight
 
-      # ── 7. Sync Firefox version (surfer.json → latest) ───────────────────
-      - name: Update Firefox version pin
-        run: npm run surfer -- update
-        # Rewrites surfer.json so the frozen version matches upstream.
-        # Without this the download step warns/fails when the repo's pinned
-        # version (e.g. 154.0.1) lags behind the latest (e.g. 156.0.1).
-
-      # ── 8. Download Firefox source tarball ───────────────────────────────
+      # ── 7. Download Firefox source tarball (frozen version) ───────────────
       - name: Download Firefox source
         run: npm run download
 
-      # ── 9. Inject Ryzen 5900 (znver3) flags into mozconfig ───────────────
+      # ── 8. Inject Ryzen 5900 (znver3) flags into mozconfig ───────────────
       - name: Inject znver3 optimisation flags
         run: |
           MOZCONFIG="configs/linux/mozconfig"
@@ -102,28 +99,26 @@ jobs:
           export CXXFLAGS="\${CXXFLAGS} ${BUILD_FLAGS}"
           export RUSTFLAGS="\${RUSTFLAGS} -C target-cpu=${MARCH} -C linker-plugin-lto"
 
-          # Use system lld (already set by configs/linux/mozconfig for releases,
-          # but explicit here so it is not overridden by a debug fallback)
           ac_add_options --enable-linker=lld
           EOF
 
           echo "=== final mozconfig ==="
           cat "${MOZCONFIG}"
 
-      # ── 10. Import Zen patches into the Firefox engine tree ──────────────
+      # ── 9. Import Zen patches into the Firefox engine tree ────────────────
       - name: Import Zen patches
         run: |
           source "$HOME/.cargo/env"
           npm run import
 
-      # ── 11. Build language packs ──────────────────────────────────────────
+      # ── 10. Build language packs ──────────────────────────────────────────
       - name: Download language packs
         run: sh scripts/download-language-packs.sh
 
-      # ── 12. Seed engine git history ───────────────────────────────────────
-      # mach bootstrap calls `git log -1 --format=%ct` inside engine/ to check
-      # commit age. The branch starts empty after `npm run import` (no commits),
-      # so git returns exit 128 and mach crashes. A single dummy commit fixes it.
+      # ── 11. Seed engine git history ───────────────────────────────────────
+      # mach bootstrap runs `git log -1 --format=%ct` inside engine/ to check
+      # commit age. After `npm run import` the branch has no commits so git
+      # exits 128 and mach crashes. One dummy commit satisfies the check.
       - name: Seed engine git history
         run: |
           cd engine
@@ -132,26 +127,26 @@ jobs:
           git add -A
           git commit --allow-empty -m "chore: seed engine tree for mach bootstrap"
 
-      # ── 13. Bootstrap Mozilla build system ───────────────────────────────
+      # ── 12. Bootstrap Mozilla build system ───────────────────────────────
       - name: Bootstrap mach
         run: |
           source "$HOME/.cargo/env"
           cd engine
           ./mach --no-interactive bootstrap --application-choice browser
 
-      # ── 14. Build ─────────────────────────────────────────────────────────
+      # ── 13. Build ─────────────────────────────────────────────────────────
       - name: Build Zen Browser
         run: |
           source "$HOME/.cargo/env"
           bash .github/workflows/src/release-build.sh
 
-      # ── 15. Package ───────────────────────────────────────────────────────
+      # ── 14. Package ───────────────────────────────────────────────────────
       - name: Package
         run: |
           source "$HOME/.cargo/env"
           npm run package
 
-      # ── 16. Rename & upload ───────────────────────────────────────────────
+      # ── 15. Rename & upload ───────────────────────────────────────────────
       - name: Rename artifact
         run: |
           mv dist/zen-*.tar.xz zen.linux-x86_64-znver3.tar.xz || \
