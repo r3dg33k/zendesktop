@@ -1,4 +1,4 @@
-name: Compile Optimized Zen Browser
+name: CachyOS-Ryzen Compile Optimized Zen Browser
 
 on:
   workflow_dispatch:
