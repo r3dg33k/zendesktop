@@ -31,12 +31,12 @@ jobs:
         run: |
           pacman -Syu --noconfirm
           pacman -S --noconfirm --needed \
-            base-devel git curl python python-pip \
+            base-devel git curl python \
             nodejs npm yasm nasm \
-            alsa-lib dbus glib2 gtk2 gtk3 \
+            alsa-lib dbus glib2 gtk3 \
             libpulse libx11 libxt libxcb mesa \
             lld llvm clang \
-            m4 uuid xorg-server-xvfb \
+            m4 xorg-server-xvfb \
             dos2unix
 
       # ── 2. Checkout ────────────────────────────────────────────────────────
